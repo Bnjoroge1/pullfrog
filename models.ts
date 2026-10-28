@@ -1267,10 +1267,12 @@ export const providers = {
         openRouterResolve: "openrouter/openai/gpt-5.4",
         fallback: "openrouter/gpt-sol",
       },
+      // OpenRouter dropped `openai/o4-mini` on 2026-10-28 (only `:batch` remains) — folds stored pins to Luna.
       "o4-mini": {
         displayName: "O4 Mini",
         resolve: "openrouter/openai/o4-mini",
         openRouterResolve: "openrouter/openai/o4-mini",
+        fallback: "openrouter/gpt-luna",
       },
       "gemini-pro": {
         displayName: "Gemini Pro",

@@ -106,6 +106,7 @@ export {
 export type { CredentialVerdict } from "../utils/credentialCheck.ts";
 export { isCredentialProbeable, verifyCredential } from "../utils/credentialCheck.ts";
 export { renderFailure } from "../utils/failureBody.ts";
+export { GENERATED } from "../utils/generatedFiles.ts";
 export type { ResourceUsage, UsageSummary } from "../utils/github.ts";
 export { isPullfrog } from "../utils/isPullfrog.ts";
 export {

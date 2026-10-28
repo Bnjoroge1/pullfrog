@@ -52,14 +52,15 @@ export function computeIncrementalDiff(
   params: ComputeIncrementalDiffParams
 ): IncrementalDiffResult {
   try {
-    // $1=beforeSha, $2=baseBranch, $3=headSha
+    // $1=beforeSha, $2=baseBranch, $3=headSha. one commit per side, so a creation factor this
+    // high always pairs them; the default 60 calls a reworked delta a rewrite and prints no patch
     const raw = $(
       "sh",
       [
         "-c",
         'old_base=$(git merge-base "$1" "origin/$2") && ' +
           'new_base=$(git merge-base "$3" "origin/$2") && ' +
-          "git range-diff --no-color " +
+          "git range-diff --no-color --creation-factor=1000 " +
           '"$old_base..$(git commit-tree "$1^{tree}" -p "$old_base" -m x)" ' +
           '"$new_base..$(git commit-tree "$3^{tree}" -p "$new_base" -m x)"',
         "--",
@@ -98,7 +99,9 @@ function isDiffPrefix(ch: string): boolean {
  *
  * uses a streaming approach: a ring buffer of before-context lines is flushed when
  * a change is hit, then afterCount lines of after-context are emitted directly.
- * nearest preceding ## / @@ headers are force-included when outside the context window.
+ * nearest preceding ## / @@ headers are force-included when outside the context window,
+ * and so is the outer `@@ <file>[: <function>]` hunk header, which is often the only
+ * line naming the file a change belongs to.
  */
 export function postProcessRangeDiff(raw: string, contextLines = 3): string | null {
   if (!raw.trim()) return null;
@@ -107,6 +110,8 @@ export function postProcessRangeDiff(raw: string, contextLines = 3): string | nu
   type Line = { prefix: string; from: number; to: number; seq: number };
 
   const beforeBuf: Line[] = [];
+  let lastOuterHdr: Line | null = null;
+  let outerHdrEmitted = true;
   let lastFileHdr: Line | null = null;
   let lastHunkHdr: Line | null = null;
   let fileHdrEmitted = true;
@@ -122,11 +127,13 @@ export function postProcessRangeDiff(raw: string, contextLines = 3): string | nu
     if (lastEmittedSeq >= 0 && line.seq > lastEmittedSeq + 1) out += (out ? "\n" : "") + "...";
     out += (out ? "\n" : "") + line.prefix + raw.slice(line.from, line.to);
     lastEmittedSeq = line.seq;
+    if (lastOuterHdr?.seq === line.seq) outerHdrEmitted = true;
     if (lastFileHdr?.seq === line.seq) fileHdrEmitted = true;
     if (lastHunkHdr?.seq === line.seq) hunkHdrEmitted = true;
   }
 
   function flushBefore() {
+    if (lastOuterHdr && !outerHdrEmitted) emit(lastOuterHdr);
     if (lastFileHdr && !fileHdrEmitted) emit(lastFileHdr);
     if (lastHunkHdr && !hunkHdrEmitted) emit(lastHunkHdr);
     for (const line of beforeBuf) {
@@ -145,7 +152,17 @@ export function postProcessRangeDiff(raw: string, contextLines = 3): string | nu
       continue;
     }
 
-    if (lineEnd - cursor >= 5 && raw.startsWith("    ", cursor)) {
+    if (raw.startsWith("    @@", cursor)) {
+      lastOuterHdr = { prefix: "", from: cursor + 4, to: lineEnd, seq };
+      outerHdrEmitted = false;
+      lastFileHdr = null;
+      fileHdrEmitted = true;
+      lastHunkHdr = null;
+      hunkHdrEmitted = true;
+      beforeBuf.length = 0;
+      afterRemaining = 0;
+      seq++;
+    } else if (lineEnd - cursor >= 5 && raw.startsWith("    ", cursor)) {
       const prefix = raw[cursor + 4];
       if (isDiffPrefix(prefix)) {
         const contentPos = cursor + 5;
