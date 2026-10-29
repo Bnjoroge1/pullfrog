@@ -742,6 +742,45 @@ function describeHead(h: InitialHead): string {
   return `detached HEAD \`${h.sha}\``;
 }
 
+const FORMER_BASE_TIPS_QUERY = `
+  query ($owner: String!, $repo: String!, $number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $number) {
+        timelineItems(itemTypes: [BASE_REF_FORCE_PUSHED_EVENT], last: 100) {
+          nodes { ... on BaseRefForcePushedEvent { beforeCommit { oid } } }
+        }
+      }
+    }
+  }
+`;
+
+type FormerBaseTipsResponse = {
+  repository: {
+    pullRequest: {
+      timelineItems: { nodes: { beforeCommit: { oid: string } | null }[] };
+    };
+  };
+};
+
+/** tips the PR's base branch was force-pushed away from. best-effort: none when the lookup fails. */
+async function getFormerBaseTips(ctx: ToolContext, pullNumber: number): Promise<string[]> {
+  try {
+    const response = await ctx.octokit.graphql<FormerBaseTipsResponse>(FORMER_BASE_TIPS_QUERY, {
+      owner: ctx.repo.owner,
+      repo: ctx.repo.name,
+      number: pullNumber,
+    });
+    return response.repository.pullRequest.timelineItems.nodes.flatMap((node) =>
+      node.beforeCommit ? [node.beforeCommit.oid] : []
+    );
+  } catch (error) {
+    log.warning(
+      `» former base tips unavailable: ${error instanceof Error ? error.message : String(error)}`
+    );
+    return [];
+  }
+}
+
 export function CheckoutPrTool(ctx: ToolContext) {
   const runCheckout = async (
     pull_number: number,
@@ -805,6 +844,7 @@ export function CheckoutPrTool(ctx: ToolContext) {
         baseBranch: pr.baseRef,
         beforeSha: primary.beforeSha,
         headSha: checkoutSha,
+        formerBaseTips: await getFormerBaseTips(ctx, pull_number),
       });
       if (incremental.status === "ok") {
         incrementalDiffPath = join(
