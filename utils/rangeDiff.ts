@@ -57,8 +57,11 @@ export function computeIncrementalDiff(
     const tips = [`origin/${params.baseBranch}`, ...params.formerBaseTips];
     const oldBase = versionBase({ sha: params.beforeSha, tips });
     const newBase = versionBase({ sha: params.headSha, tips });
-    // $1=oldBase, $2=beforeSha, $3=newBase, $4=headSha. one commit per side, so a creation factor
-    // this high always pairs them; the default 60 calls a reworked delta a rewrite and prints no patch
+    const replayed =
+      oldBase === newBase ? null : replay({ sha: params.beforeSha, from: oldBase, onto: newBase });
+    // $1/$2=the old version's base and tree (newBase and the replayed tree once replayed),
+    // $3=newBase, $4=headSha. one commit per side, so a creation factor this high always pairs
+    // them; the default 60 calls a reworked delta a rewrite and prints no patch
     const raw = $(
       "sh",
       [
@@ -67,8 +70,8 @@ export function computeIncrementalDiff(
           '"$1..$(git commit-tree "$2^{tree}" -p "$1" -m x)" ' +
           '"$3..$(git commit-tree "$4^{tree}" -p "$3" -m x)"',
         "--",
-        oldBase,
-        params.beforeSha,
+        replayed ? newBase : oldBase,
+        replayed ?? params.beforeSha,
         newBase,
         params.headSha,
       ],
@@ -114,6 +117,28 @@ function versionBase(params: { sha: string; tips: string[] }): string {
     log.info(`» incremental diff: ${params.sha.slice(0, 7)} sits on former base tip ${best.tip}`);
   }
   return best.sha;
+}
+
+/**
+ * the old version's tree replayed onto the new base, so whatever the new base already carries drops
+ * out: a parent PR squash-merged into it (no merge base reaches those commits), or main's own changes
+ * near the PR's lines. null when the replay conflicts, and each version is compared on its own base.
+ */
+function replay(params: { sha: string; from: string; onto: string }): string | null {
+  try {
+    return git([
+      "merge-tree",
+      "--write-tree",
+      `--merge-base=${params.from}`,
+      params.onto,
+      params.sha,
+    ]);
+  } catch {
+    log.info(
+      `» incremental diff: ${params.sha.slice(0, 7)} does not replay onto the new base; comparing each on its own`
+    );
+    return null;
+  }
 }
 
 function isDiffPrefix(ch: string): boolean {
