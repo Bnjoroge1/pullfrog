@@ -196,7 +196,7 @@ export function buildUnsubmittedReviewPrompt(mode: "Review" | "IncrementalReview
     "",
     "do exactly one of:",
     "- if you have findings: call `create_pull_request_review` now with your aggregated review (body + inline comments). the first call may error once with a diff-coverage nudge — retry the same call to proceed.",
-    "- if there are genuinely no actionable findings since the last review (e.g. only formatting / comment / lockfile changes): call `report_progress` with a 1-2 sentence summary explaining that no review was warranted.",
+    "- if there are genuinely no actionable findings since the last review (e.g. only formatting / comment / lockfile changes): call `report_progress` with `no_review_needed: true` and a 1-2 sentence summary explaining that no review was warranted.",
     "",
     "do NOT stop again until one of those tools has been called successfully.",
   ].join("\n");
@@ -359,7 +359,7 @@ function buildXrepoLearningsReflectionPrompt(filePath: string): string {
  * a reflection-skip mode like IncrementalReview).
  */
 export function buildReflectionPrompt(toolState: ToolState): string | undefined {
-  if (!shouldRunReflection(toolState.selectedMode)) return undefined;
+  if (!shouldRunReflection(toolState.selectedMode) || toolState.learningsLocked) return undefined;
   const parts: string[] = [];
   if (toolState.learningsFilePath) {
     parts.push(buildLearningsReflectionPrompt(toolState.learningsFilePath));

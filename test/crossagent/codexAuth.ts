@@ -9,7 +9,7 @@ import { defineFixture } from "../utils.ts";
  *
  * Pins the raw `openai/gpt-5.5` specifier — one of the ids in upstream
  * opencode's Codex `ALLOWED_MODELS` allow list — NOT the `openai/gpt` alias,
- * which now rolls to gpt-5.6-sol. This test validates the model-agnostic
+ * which now rolls to gpt-6.1-sol. This test validates the model-agnostic
  * auth-refresh chain, so it stays on a stable allow-listed model rather than
  * following the flagship roll. Runs the full opencode harness against the
  * developer's / CI's `CODEX_AUTH_JSON`. Exercises:
@@ -100,19 +100,6 @@ export const test: TestRunnerOptions = {
     PULLFROG_MODEL: "openai/gpt-5.5",
     PULLFROG_DISABLE_SECURITY_INSTRUCTIONS: "1",
   },
-  coverage: [
-    "action/utils/codexHome.ts",
-    "action/utils/codexRefreshDetect.ts",
-    "action/entryPost.ts",
-    // opencode ONLY, matching `agents` below. widening this to codex made the
-    // test TRIGGER on codex changes and then run zero codex jobs, since the
-    // runner intersects `agents` with the requested set. adding codex to
-    // `agents` instead would gamble on the Codex backend serving the
-    // `openai/gpt-5.5` pin above, which the comment there deliberately chose
-    // for opencode's allow-list; the codex branch of `detectCodexRefresh` has
-    // unit coverage instead. see wiki/codex-agent.md.
-    "action/agents/{opencode}.ts",
-  ],
   // forks + contributors without the Codex secret skip cleanly rather than
   // failing on `auth_materialized=✗` and (with fail-fast: true) cascading
   // cancellation across the rest of the matrix. CI on `pullfrog/app` and

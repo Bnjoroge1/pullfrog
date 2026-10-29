@@ -10,6 +10,12 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import {
+  CLI_CONTRACT_HEADER,
+  CLI_CONTRACT_VERSION,
+  CLI_UPGRADE_MESSAGE,
+  CliContractError,
+} from "../cliContract.ts";
 import { PULLFROG_API_URL } from "./_shared.ts";
 
 export type StreamEvent = {
@@ -25,12 +31,18 @@ export type PollResult = { cursor: string; events: StreamEvent[] };
 
 export type PrTarget = { owner: string; repo: string; pr: number };
 
-/** per-request ceiling — must exceed the server long-poll window (25s) so the
+/** per-request ceiling — must exceed the server long-poll window (~20s) so the
  * held connection returns normally rather than aborting client-side. */
 const REQUEST_TIMEOUT_MS = 35_000;
 
-/** the server's own long-poll window, and so the granularity of any wait. */
-export const SERVER_POLL_WINDOW_MS = 25_000;
+/** the server's own long-poll budget, and so the granularity of any wait. keep
+ * it at or below that budget: `waitForPrEvents` loops until this deadline, so a
+ * value above it leaves enough time for a SECOND request — re-running the GitHub
+ * authorization round-trip and the lease/sweep writes — only to abort it
+ * mid-flight. at or below, the second iteration hits an already-fired abort
+ * signal and never reaches the network. the server measures its budget from
+ * request entry (app/api/cli/pr-events/route.ts). */
+export const SERVER_POLL_WINDOW_MS = 20_000;
 
 /**
  * terminal, non-retryable failures. these are thrown rather than exiting so
@@ -42,8 +54,14 @@ export class PrEventsAccessError extends Error {}
 
 /** an answer no retry can improve: the token is bad, or the repo is not ours to
  * read. everything else is worth another attempt. */
-export function isTerminal(error: unknown): error is PrEventsAuthError | PrEventsAccessError {
-  return error instanceof PrEventsAuthError || error instanceof PrEventsAccessError;
+export function isTerminal(
+  error: unknown
+): error is PrEventsAuthError | PrEventsAccessError | CliContractError {
+  return (
+    error instanceof PrEventsAuthError ||
+    error instanceof PrEventsAccessError ||
+    error instanceof CliContractError
+  );
 }
 
 export async function pollPrEvents(
@@ -66,9 +84,13 @@ export async function pollPrEvents(
   else ctx.signal?.addEventListener("abort", onCallerAbort, { once: true });
   try {
     const response = await fetch(`${PULLFROG_API_URL}/api/cli/pr-events?${params}`, {
-      headers: { authorization: `Bearer ${ctx.token}` },
+      headers: {
+        authorization: `Bearer ${ctx.token}`,
+        [CLI_CONTRACT_HEADER]: CLI_CONTRACT_VERSION,
+      },
       signal: controller.signal,
     });
+    if (response.status === 426) throw new CliContractError(CLI_UPGRADE_MESSAGE);
     if (response.status === 401 || response.status === 403) {
       throw new PrEventsAuthError("invalid or expired github token — run `gh auth login`.");
     }
@@ -141,10 +163,10 @@ export async function resolveCursor(
 
 /**
  * block until new events land on the PR or `maxWaitMs` elapses, whichever comes
- * first. the server holds each request for its own ~25s window, so the deadline
+ * first. the server holds each request for its own ~20s window, so the deadline
  * has to cancel the request in flight rather than be checked between requests —
  * otherwise every wait rounds up to a full server window and a caller asking
- * for 8s waits 26s.
+ * for 8s waits the whole window.
  *
  * cancelling mid-hold loses nothing: the cursor only advances on a response we
  * actually received, so anything the server was about to send is still pending

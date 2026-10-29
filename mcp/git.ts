@@ -281,6 +281,7 @@ async function runPrepushHook(ctx: ToolContext, retryTool: string): Promise<bool
   const prepushHook = await executeLifecycleHook({
     event: "prepush",
     script: ctx.prepushScript,
+    shell: ctx.payload.shell,
   });
   if (prepushHook.failure) {
     ctx.toolState.prepushFailureCount += 1;
@@ -436,7 +437,9 @@ export function PushBranchTool(ctx: ToolContext) {
     execute: execute(async ({ branchName, force, repo }) => {
       // permission check
       if (pushPermission === "disabled") {
-        throw new Error("Push is disabled. This repository is configured for read-only access.");
+        throw new Error(
+          "Push is disabled for this run: the repository is read-only, or the person who triggered it has no write access."
+        );
       }
       assertWritableMode(ctx, "push_branch");
 
@@ -647,7 +650,9 @@ export function CommitChangesTool(ctx: ToolContext) {
     timeoutMs: 600_000,
     execute: execute(async (params) => {
       if (pushPermission === "disabled") {
-        throw new Error("Push is disabled. This repository is configured for read-only access.");
+        throw new Error(
+          "Push is disabled for this run: the repository is read-only, or the person who triggered it has no write access."
+        );
       }
       assertWritableMode(ctx, "commit_changes");
 

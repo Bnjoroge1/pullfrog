@@ -1,6 +1,16 @@
+import { randomUUID } from "node:crypto";
 import type { PushPermission, ShellPermission } from "../external.ts";
+import type { RouterTier } from "../models.ts";
 import { apiFetch } from "./apiFetch.ts";
+import type { CommercialRefusal } from "./billingErrors.ts";
 import type { RepoContext } from "./github.ts";
+import type { CredentialAccess } from "./subscriptionCredentials.ts";
+
+/**
+ * One per process, which is one start of the action within its GitHub run. Sent to run-context
+ * first, so a custom run's start is recorded before it reports, and then on each workflow-run PATCH.
+ */
+export const START_KEY = randomUUID();
 
 export interface Mode {
   id: string;
@@ -38,6 +48,8 @@ export interface RepoSettings {
   push: PushPermission;
   shell: ShellPermission;
   prApproveEnabled: boolean;
+  // "Include draft PRs": the post-run safety net re-reviews a moved draft only when set.
+  reviewDrafts: boolean;
   // already globally-gated server-side (run-context ANDs the per-repo toggle with
   // the `isAutonomousMaintenanceEnabled()` kill switch), so the runtime treats it
   // as the final "may auto-merge" verdict. see autoMergeAfterApprove.
@@ -76,23 +88,22 @@ export interface RepoSettings {
  */
 export type AccountPlan = "none" | "payg";
 
-/**
- * The org commercial gate's refusal (billing model v2). Set when run-context
- * returns 402 for a `paused`/`unpaid` org — the backstop for manual re-runs and
- * self-configured triggers that never hit reserveRun. main.ts stops before
- * installing the agent or loading account secrets and writes actionable copy.
- * A forked action can bypass this response, so proxy-token enforces the same
- * verdict before issuing a Pullfrog Router key.
- */
-export type CommercialRefusal = "commercial" | "subscription_unpaid";
-
 export interface RunContext {
+  credentialAccess?: CredentialAccess | undefined;
   settings: RepoSettings;
   apiToken: string;
   oss: boolean;
   plan: AccountPlan;
   proxyModel?: string | undefined;
   dbSecrets?: Record<string, string> | undefined;
+  /**
+   * The org commercial gate's refusal (billing model v2). Set when run-context
+   * returns 402 for a `paused`/`unpaid` org — the backstop for manual re-runs and
+   * self-configured triggers that never hit reserveRun. main.ts stops before
+   * installing the agent or loading account secrets and writes actionable copy.
+   * A forked action can bypass this response, so proxy-token enforces the same
+   * verdict before issuing a Pullfrog Router key.
+   */
   commercialRefused?: CommercialRefusal | undefined;
   /**
    * the server tried and failed to materialize Pullfrog-stored secrets (or we
@@ -111,6 +122,13 @@ export interface RunContext {
    * funding state. see wiki/billing.md.
    */
   routerUnfunded?: boolean | undefined;
+  /** the account is inside its no-card trial and nothing else could fund this
+   * run — the runner may mint a subsidized efficient-tier key if, and only if,
+   * its own key search comes up dry. see the run-context route. */
+  trialFallback?: boolean | undefined;
+  /** the trial account's remaining funded credits, in USD, when it is inside its
+   * trial at all. zero or below means the credits are used up. */
+  trialCreditsLeftUsd?: number | undefined;
 }
 
 const defaultSettings: RepoSettings = {
@@ -124,6 +142,7 @@ const defaultSettings: RepoSettings = {
   push: "restricted",
   shell: "restricted",
   prApproveEnabled: false,
+  reviewDrafts: false,
   autoMergeEnabled: false,
   codexAgent: false,
   signedCommits: false,
@@ -168,6 +187,15 @@ export async function fetchRunContext(params: {
   token: string;
   repoContext: RepoContext;
   oidcToken?: string | undefined;
+  /** `payload.type` — lets the server apply this repo's per-trigger model
+   * override, which it cannot derive from owner/repo alone. */
+  runType?: string | undefined;
+  /** a plain-text prompt, which no Pullfrog dispatch sends — so the server
+   * can record this run without waiting for a reservation to claim it. */
+  plainPrompt: boolean;
+  /** `payload.routing.tier` — the model router's tier, which run-context
+   * applies to the Router proxy mint the same way it applies `runType`. */
+  routedTier?: RouterTier | undefined;
 }): Promise<RunContext> {
   const timeoutMs = 30000;
   const controller = new AbortController();
@@ -176,13 +204,19 @@ export async function fetchRunContext(params: {
   try {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${params.token}`,
+      "X-Pullfrog-Credential-Pools": "1",
     };
     if (params.oidcToken) {
       headers["X-GitHub-OIDC-Token"] = params.oidcToken;
     }
 
+    const query = new URLSearchParams({ start: START_KEY });
+    if (params.runType) query.set("type", params.runType);
+    if (params.plainPrompt) query.set("prompt", "plain");
+    if (params.routedTier) query.set("tier", params.routedTier);
+    const search = query.toString();
     const response = await apiFetch({
-      path: `/api/repo/${params.repoContext.owner}/${params.repoContext.name}/run-context`,
+      path: `/api/repo/${params.repoContext.owner}/${params.repoContext.name}/run-context${search ? `?${search}` : ""}`,
       headers,
       signal: controller.signal,
     });
@@ -195,14 +229,11 @@ export async function fetchRunContext(params: {
     // block runs).
     if (response.status === 402) {
       const body: unknown = await response.json().catch(() => null);
-      const reason: CommercialRefusal =
-        typeof body === "object" &&
-        body !== null &&
-        "reason" in body &&
-        body.reason === "subscription_unpaid"
-          ? "subscription_unpaid"
-          : "commercial";
-      return { ...defaultRunContext, commercialRefused: reason };
+      const reason =
+        typeof body === "object" && body !== null && "reason" in body ? body.reason : null;
+      const commercialRefused: CommercialRefusal =
+        reason === "subscription_unpaid" || reason === "subscription_ended" ? reason : "commercial";
+      return { ...defaultRunContext, commercialRefused };
     }
 
     if (!response.ok) {
@@ -218,8 +249,11 @@ export async function fetchRunContext(params: {
       plan?: AccountPlan;
       proxyModel?: string;
       dbSecrets?: Record<string, string>;
+      credentialAccess?: CredentialAccess;
       secretsUnavailable?: boolean;
       routerUnfunded?: boolean;
+      trialFallback?: boolean;
+      trialCreditsLeftUsd?: number;
     } | null;
 
     if (data === null) {
@@ -245,8 +279,11 @@ export async function fetchRunContext(params: {
       plan: data.plan ?? "none",
       proxyModel: data.proxyModel,
       dbSecrets: data.dbSecrets,
+      credentialAccess: data.credentialAccess,
       secretsUnavailable: data.secretsUnavailable,
       routerUnfunded: data.routerUnfunded,
+      trialFallback: data.trialFallback,
+      trialCreditsLeftUsd: data.trialCreditsLeftUsd,
     };
   } catch {
     // network drop, abort at the 30s timeout, or an unparseable body — we never

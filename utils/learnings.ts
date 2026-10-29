@@ -99,7 +99,7 @@ export async function readLearningsFile(path: string): Promise<string | null> {
  */
 export async function persistLearnings(ctx: ToolContext): Promise<void> {
   const filePath = ctx.toolState.learningsFilePath;
-  if (!filePath) return;
+  if (!filePath || ctx.toolState.learningsLocked) return;
   if (ctx.toolState.learningsPersistAttempted) return;
   ctx.toolState.learningsPersistAttempted = true;
   const current = await readLearningsFile(filePath);
@@ -156,7 +156,7 @@ export async function persistLearnings(ctx: ToolContext): Promise<void> {
  */
 export async function persistXrepoLearnings(ctx: ToolContext): Promise<void> {
   const filePath = ctx.toolState.xrepoLearningsFilePath;
-  if (!filePath) return;
+  if (!filePath || ctx.toolState.learningsLocked) return;
   if (ctx.toolState.xrepoLearningsPersistAttempted) return;
   ctx.toolState.xrepoLearningsPersistAttempted = true;
   const current = await readLearningsFile(filePath);

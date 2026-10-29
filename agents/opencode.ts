@@ -39,7 +39,7 @@
  *     a stdout sentinel envelope.
  *
  * What stays identical:
- *   - bash: "deny" via OPENCODE_CONFIG_CONTENT
+ *   - native bash blocked (listed as "ask", thrown on by the gate plugin)
  *   - OPENCODE_PERMISSION filesystem sandbox — deny-all + allow /tmp
  *   - MCP Pullfrog server injected via `mcp.<name> = { type: "remote", url }`
  *   - ASKPASS for git auth
@@ -51,9 +51,9 @@
  */
 import { type ChildProcess, spawn as nodeSpawn } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
+import { totalmem } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
-import * as core from "@actions/core";
 import {
   type AssistantMessage,
   createOpencodeClient,
@@ -75,11 +75,15 @@ import {
 } from "../utils/activity.ts";
 import type { AgentDiagnostic } from "../utils/agentHangReport.ts";
 import { formatJsonValue, log } from "../utils/cli.ts";
-import { installCodexAuth } from "../utils/codexHome.ts";
+import { installCodexAuth, installXaiAuth } from "../utils/codexHome.ts";
+import type { OAuthWriteback } from "../utils/codexRefreshDetect.ts";
+import { OAUTH_WRITEBACK_STATE } from "../utils/oauthWriteback.ts";
+import { openCodeHomeEnv } from "../utils/openCodeModels.ts";
 import { findProviderErrorMatch } from "../utils/providerErrors.ts";
 import { resolveRunEffort } from "../utils/runEffort.ts";
+import { saveSecretState } from "../utils/secretCommands.ts";
 import { addSkill, installBundledSkills } from "../utils/skills.ts";
-import { trackChild, untrackChild } from "../utils/subprocess.ts";
+import { isTrackedChild, trackChild, untrackChild } from "../utils/subprocess.ts";
 import type { TodoTracker } from "../utils/todoTracking.ts";
 import { getDevDependencyVersion } from "../utils/version.ts";
 import { resolveVertexOpenCodeModel } from "../utils/vertex.ts";
@@ -94,9 +98,11 @@ import {
   azureProvider,
   buildReviewerAgentConfig,
   installOpencodeCli,
-  kimiOpenRouterProviderOverrides,
   type OpenCodeConfig,
   openAICompatibleProvider,
+  openRouterDataCollection,
+  openRouterProvider,
+  providerGatewayOverride,
 } from "./opencodeShared.ts";
 import { buildReflectionPrompt, runPostRunRetryLoop } from "./postRun.ts";
 import { REVIEWER_AGENT_NAME } from "./reviewer.ts";
@@ -118,7 +124,11 @@ const installCli = () => installOpencodeCli({ binPath: "bin/opencode.exe" });
 function buildSecurityConfig(ctx: AgentRunContext, model: string | undefined): string {
   const config: OpenCodeConfig = {
     permission: {
-      bash: "deny",
+      // listed but never run: Zen's free tier 403s a tool list missing `bash`,
+      // `glob`, `grep` or `read` (2026-09-17), so the gate plugin throws on
+      // every bash call and "ask" (no responder in serve mode) fails closed.
+      // never switch one of those four to "deny". see wiki/security.md.
+      bash: "ask",
       edit: "allow",
       read: "allow",
       webfetch: "allow",
@@ -144,15 +154,15 @@ function buildSecurityConfig(ctx: AgentRunContext, model: string | undefined): s
       log.info(`» subagent models: reviewfrog=${reviewerModel}`);
       return cfg;
     })(),
-    // kimi pinned away from Enforcer-less openrouter providers (siliconflow /
-    // together) that drop optional tool-call params — per-model on the
-    // openrouter route, so other models are unaffected. this is routing, not
-    // reasoning: every model's effort now rides the per-prompt `variant`.
-    // see opencodeShared.ts.
+    // openrouter routing, not reasoning (every model's effort rides the
+    // per-prompt `variant`): the run's data-collection policy, kimi pinned
+    // away from Enforcer-less providers, the Muse Spark contributor tier
+    // opened to training hosts. see opencodeShared.ts.
     provider: {
-      openrouter: { models: kimiOpenRouterProviderOverrides() },
+      openrouter: openRouterProvider(openRouterDataCollection(ctx)),
       ...openAICompatibleProvider(model),
       ...azureProvider(model),
+      ...providerGatewayOverride(model),
     },
   };
 
@@ -177,6 +187,27 @@ function parseModel(
   return { providerID: value.slice(0, slash), modelID: value.slice(slash + 1) };
 }
 
+/**
+ * land a configured effort on the variants the server declares for a model the
+ * catalog has no alias for. it is the same `variants` map opencode's request
+ * path indexes, so the rung is one it can apply; a model it does not list gets
+ * no flag. see wiki/effort.md.
+ */
+async function resolveDeclaredRung(
+  ctx: AgentRunContext,
+  params: { client: OpencodeClient; model: { providerID: string; modelID: string } }
+): Promise<string | undefined> {
+  const resp = await params.client.config.providers();
+  const provider = resp.data?.providers.find((p) => p.id === params.model.providerID);
+  const variants = provider?.models[params.model.modelID]?.variants ?? {};
+  const name = `${params.model.providerID}/${params.model.modelID}`;
+  const rung = resolveRunEffort({ ...ctx, declaredVariants: Object.keys(variants) }).rung;
+  log.info(
+    `» effort: ${rung ? `${rung} (declared by opencode for ${name})` : `not applied — opencode declares no variants for ${name}`}`
+  );
+  return rung;
+}
+
 // ── server boot ────────────────────────────────────────────────────────────────
 
 interface ServerHandle {
@@ -186,6 +217,8 @@ interface ServerHandle {
   close: () => Promise<void>;
   /** rolling tail of server stderr for diagnostics. */
   recentStderr: string[];
+  /** why the server died on its own after boot; undefined while it is up or once `close()` ran. */
+  exitCause: () => string | undefined;
 }
 
 /**
@@ -245,11 +278,15 @@ function bootOpencodeServer(params: {
   });
 
   let closed = false;
+  let exitCause: string | undefined;
   const close = async (): Promise<void> => {
     if (closed) return;
     closed = true;
     untrackChild(proc);
-    if (proc.pid && !proc.killed) {
+    // `killed` only records a signal WE sent. a server that already died has
+    // fired its `close` event, and waiting for it again hangs the run until
+    // the outer watchdog kills it.
+    if (proc.pid && proc.exitCode === null && proc.signalCode === null) {
       try {
         process.kill(-proc.pid, "SIGTERM");
       } catch {
@@ -287,7 +324,7 @@ function bootOpencodeServer(params: {
         if (match?.[1]) {
           resolved = true;
           log.info(`» opencode server up: ${match[1]}`);
-          resolve({ baseUrl: match[1], proc, close, recentStderr });
+          resolve({ baseUrl: match[1], proc, close, recentStderr, exitCause: () => exitCause });
           // keep draining for debug visibility after handover.
         }
       }
@@ -307,6 +344,12 @@ function bootOpencodeServer(params: {
       if (!resolved) {
         reject(new Error(`failed to spawn opencode serve: ${err.message}`));
       }
+    });
+    proc.once("exit", (code, signal) => {
+      // untracked means we killed it: `close()`, or `killTrackedChildren()` on a timeout or cancel.
+      if (!resolved || !isTrackedChild(proc)) return;
+      exitCause = describeServerExit(code, signal);
+      log.warning(withServerStderr(`» ${exitCause}`, recentStderr));
     });
     proc.once("close", (code, signal) => {
       if (!resolved) {
@@ -346,6 +389,19 @@ function bootOpencodeServer(params: {
 function withServerStderr(message: string, recentStderr: readonly string[]): string {
   const tail = recentStderr.join("\n").trim();
   return tail ? `${message}\nopencode server stderr:\n${tail}` : message;
+}
+
+/**
+ * Name why the server died under a live run. Our own kills untrack it first, so
+ * a SIGKILL arriving here is almost always the kernel's OOM killer, and the
+ * memory the job may use is what the customer needs to act on it.
+ */
+function describeServerExit(code: number | null, signal: NodeJS.Signals | null): string {
+  if (signal !== "SIGKILL") return `opencode server exited mid-run (${signal ?? `code ${code}`})`;
+  // a cgroup limit (k8s, ARC) is what the OOM killer enforces; with none it reads 0 or UINT64_MAX.
+  const limit = process.constrainedMemory();
+  const memoryGb = ((limit > 0 ? Math.min(limit, totalmem()) : totalmem()) / 1024 ** 3).toFixed(1);
+  return `opencode server was killed (SIGKILL) mid-run, usually by the kernel OOM killer — this runner has ${memoryGb} GB of memory`;
 }
 
 // ── per-turn state ─────────────────────────────────────────────────────────────
@@ -427,6 +483,12 @@ interface RunnerContext {
   mcpToolCalls: number;
   /** rolling stderr tail from the server process (for diagnostics). */
   recentStderr: string[];
+  serverExitCause: ServerHandle["exitCause"];
+  /**
+   * the orchestrator's last `session.error` this turn. opencode reports a model-not-found
+   * ONLY there — the prompt itself gets an opaque 500 (#1470).
+   */
+  lastSessionError: string | undefined;
   diagnostic: AgentDiagnostic;
 }
 
@@ -511,6 +573,7 @@ async function dispatchEvent(ctx: RunnerContext, event: EventSubscribeResponse):
     const err = event.properties.error;
     const message = err ? extractErrorMessage(err) : "(no error payload)";
     log.info(`» ${ctx.label} session error: ${message}`);
+    if (err) ctx.lastSessionError = message;
     return;
   }
   // session.idle / session.status are useful breadcrumbs but we don't drive
@@ -775,6 +838,7 @@ async function runPromptTurn(
   // recovered from, and would otherwise render that stale fire's story.
   ctx.diagnostic.sawModelOutput = false;
   ctx.diagnostic.idleSec = undefined;
+  ctx.lastSessionError = undefined;
 
   let assistant: AssistantMessage | undefined;
   let returnedParts: Part[] | undefined;
@@ -848,9 +912,15 @@ async function runPromptTurn(
   // reported as "the model went silent" — the stderr subscriber knew the
   // cause seconds after session.create, and the claude harness already names
   // it on its own timeout path. see #1183.
-  const diagnosis = ctx.diagnostic.lastProviderError
-    ? ` — likely cause: ${ctx.diagnostic.lastProviderError}`
-    : "";
+  // a dead server outranks a provider error: it is why every later request failed.
+  const cause = ctx.serverExitCause() ?? ctx.diagnostic.lastProviderError;
+  const diagnosis = cause ? ` — likely cause: ${cause}` : "";
+  // a session error explains only a prompt that failed before any output (model-not-found): one
+  // after output, or after a watchdog abort, is a condition opencode recovered from (#1069).
+  const promptCause =
+    ctx.serverExitCause() ??
+    (ctx.diagnostic.sawModelOutput ? undefined : ctx.lastSessionError) ??
+    ctx.diagnostic.lastProviderError;
 
   if (networkError) {
     // a watchdog-fired abort surfaces here as a caught `session.prompt`
@@ -863,7 +933,7 @@ async function runPromptTurn(
       output: finalText,
       error: params.signal.aborted
         ? `activity timeout: the model went silent and the turn was aborted by the activity watchdog (${networkError})${diagnosis}`
-        : `opencode prompt failed: ${networkError}${diagnosis}`,
+        : `opencode prompt failed: ${networkError}${promptCause ? ` — likely cause: ${promptCause}` : ""}`,
       usage,
     };
   }
@@ -1194,10 +1264,17 @@ export const opencode = agent({
     const vertexModel = resolveVertexOpenCodeModel(rawModel);
     const model = vertexModel ?? (isBedrockRoute ? `amazon-bedrock/${rawModel}` : rawModel);
 
-    const homeEnv = {
-      HOME: ctx.tmpdir,
-      XDG_CONFIG_HOME: join(ctx.tmpdir, ".config"),
-    };
+    // materialize CODEX_AUTH_JSON into the run's subscription data dir so
+    // OpenCode's CodexAuthPlugin picks it up. see action/utils/codexHome.ts and
+    // wiki/codex-auth.md.
+    const codexAuth = installCodexAuth();
+
+    // same for GROK_AUTH_JSON -> opencode's native XaiAuthPlugin. an account
+    // can hold both chains; the writer merges rather than overwrites.
+    const xaiAuth = installXaiAuth();
+
+    // after both installs: XDG_DATA_HOME names the dir they wrote into.
+    const homeEnv = openCodeHomeEnv(ctx.tmpdir);
     // install the subagent gate into opencode's auto-discovered plugin dir
     // (under the tmpdir-redirected XDG_CONFIG_HOME). v2 installs ONLY the gate,
     // not the events re-emitter — it reads subagent events off the SDK stream,
@@ -1206,7 +1283,7 @@ export const opencode = agent({
     mkdirSync(opencodePluginDir, { recursive: true });
     writeFileSync(
       join(opencodePluginDir, PULLFROG_OPENCODE_GATE_PLUGIN_FILENAME),
-      buildOpencodeSubagentGateSource(ctx.subagentDeniedTools)
+      buildOpencodeSubagentGateSource(ctx)
     );
 
     const agentBrowserVersion = getDevDependencyVersion("agent-browser");
@@ -1218,15 +1295,10 @@ export const opencode = agent({
     });
     installBundledSkills({ home: homeEnv.HOME });
 
-    // materialize CODEX_AUTH_JSON into the runner's real $HOME/.local/share/
-    // opencode/auth.json so OpenCode's CodexAuthPlugin picks it up. see
-    // action/utils/codexHome.ts and wiki/codex-auth.md.
-    const codexAuth = installCodexAuth();
-
     // OPENCODE_PERMISSION has absolute highest precedence (merged after managed/MDM configs).
     // external_directory gates ALL native filesystem tools (Read, Write, Edit, Glob, Grep, etc.)
     // for paths outside the project root. last-match-wins: deny everything, then allow /tmp.
-    // codex auth lives at /var/lib/pullfrog/opencode/auth.json in CI (see codexHome.ts),
+    // codex auth lives at /var/lib/pullfrog/run-*/opencode/auth.json in CI (see codexHome.ts),
     // which is outside /tmp/* — deny-default protects it from native FS tools.
     //
     // read + edit rules deny git surfaces INSIDE the project root, where
@@ -1238,8 +1310,19 @@ export const opencode = agent({
     // recursive in opencode's Wildcard dialect. grep/glob match the search
     // pattern not a filepath, so they can't be path-denied (documented in
     // wiki/security.md). canonical surfaces: action/agents/nativeFsDenies.ts.
+    // the plugin dir sits under /tmp (the per-run HOME), which the /tmp allow
+    // would otherwise expose to native FS tools. deny it back AFTER that allow
+    // (last-match-wins) so the agent cannot rewrite a pullfrog plugin to capture
+    // the env it loads with — the OpenCode side of the hook seal. opencode's own
+    // plugin loader is unaffected (it does not go through this tool gate). the
+    // MCP shell is sealed separately by the read-only bind in action/mcp/shell.ts.
     const permissionOverride = JSON.stringify({
-      external_directory: { "*": "deny", "/tmp/*": "allow" },
+      external_directory: {
+        "*": "deny",
+        "/tmp/*": "allow",
+        [opencodePluginDir]: "deny",
+        [`${opencodePluginDir}/*`]: "deny",
+      },
       read: { "*": "allow", ...GIT_NATIVE_READ_DENY_OPENCODE },
       edit: { "*": "allow", ...GIT_NATIVE_WRITE_DENY_OPENCODE },
     });
@@ -1263,21 +1346,38 @@ export const opencode = agent({
     // opencode 1.18 gates a code-mode `execute` tool — a script interpreter —
     // behind either of these. the spawn env inherits the workflow's `env:` block,
     // so leaving them set would let a repo-level variable hand the agent shell
-    // execution that sidesteps `bash: "deny"`. shell goes through pullfrog_shell,
+    // execution that sidesteps the bash block. shell goes through pullfrog_shell,
     // always. see wiki/sandbox-v2.md.
     delete env.OPENCODE_EXPERIMENTAL;
     delete env.OPENCODE_EXPERIMENTAL_CODE_MODE;
+    // both chains rotate mid-run inside opencode, so each needs a post-hook
+    // writeback entry. the API key is dropped only for the provider whose
+    // subscription is driving the run — an OPENAI_API_KEY outranks the Codex
+    // OAuth chain, and XAI_API_KEY likewise outranks the Grok one.
+    const writebacks: OAuthWriteback[] = [];
     if (codexAuth) {
-      env.XDG_DATA_HOME = codexAuth.xdgDataHome;
       delete env.OPENAI_API_KEY;
-      core.saveState(
-        "codex_writeback",
-        JSON.stringify({
-          apiToken: ctx.apiToken,
-          authPath: codexAuth.authPath,
-          originalRefresh: codexAuth.originalRefresh,
-          originalIdToken: codexAuth.originalIdToken,
-        })
+      writebacks.push({
+        secretName: "CODEX_AUTH_JSON",
+        provider: "openai",
+        authPath: codexAuth.authPath,
+        originalRefresh: codexAuth.originalRefresh,
+        originalIdToken: codexAuth.originalIdToken,
+      });
+    }
+    if (xaiAuth) {
+      delete env.XAI_API_KEY;
+      writebacks.push({
+        secretName: "GROK_AUTH_JSON",
+        provider: "xai",
+        authPath: xaiAuth.authPath,
+        originalRefresh: xaiAuth.originalRefresh,
+      });
+    }
+    if (writebacks.length > 0) {
+      saveSecretState(
+        OAUTH_WRITEBACK_STATE,
+        JSON.stringify({ apiToken: ctx.apiToken, entries: writebacks })
       );
     }
 
@@ -1352,6 +1452,15 @@ export const opencode = agent({
       const labeler = new SessionLabeler();
       labeler.labelFor(sessionID);
 
+      const sdkModel = parseModel(model);
+      const variant =
+        effort.declarable && sdkModel
+          ? await resolveDeclaredRung(
+              { ...ctx, resolvedModel: rawModel },
+              { client, model: sdkModel }
+            )
+          : effort.rung;
+
       const runnerCtx: RunnerContext = {
         client,
         sessionID,
@@ -1360,7 +1469,7 @@ export const opencode = agent({
         labeler,
         toolState: ctx.toolState,
         // `rawModel` folds in the auto-select pick — see the opencode.ts twin.
-        variant: effort.rung,
+        variant,
         todoTracker: ctx.todoTracker,
         onActivityTimeout: ctx.onActivityTimeout,
         onTurnRecovered: ctx.onTurnRecovered,
@@ -1373,6 +1482,8 @@ export const opencode = agent({
         loggedToolCallIDs: new Set(),
         mcpToolCalls: 0,
         recentStderr: server.recentStderr,
+        serverExitCause: server.exitCause,
+        lastSessionError: undefined,
         diagnostic: {
           label: "Pullfrog",
           recentStderr: server.recentStderr,
@@ -1436,8 +1547,6 @@ export const opencode = agent({
         timeoutMs: AGENT_ACTIVITY_TIMEOUT_MS,
         abortTurn: () => turnController.abort(),
       });
-
-      const sdkModel = parseModel(model);
 
       // one salvage per run. the stall is provider-side, so a second attempt in
       // the same run is unlikely to differ, and each one costs up to a full idle

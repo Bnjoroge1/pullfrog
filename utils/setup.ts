@@ -1,5 +1,5 @@
 import { execFileSync, execSync } from "node:child_process";
-import { mkdtempSync, readdirSync, realpathSync, unlinkSync } from "node:fs";
+import { mkdtempSync, readdirSync, realpathSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as core from "@actions/core";
@@ -8,25 +8,68 @@ import { requireRepoState, type ToolState } from "../toolState.ts";
 import { log } from "./cli.ts";
 import type { OctokitWithPlugins } from "./github.ts";
 import { isInsideDocker } from "./globals.ts";
+import { saveSecretState } from "./secretCommands.ts";
 import { $ } from "./shell.ts";
 
 export interface SetupOptions {
   tempDir: string;
 }
 
+/** GHA state key for the per-run temp dir; `entryPost.ts` spells it literally. */
+const TEMP_DIR_STATE = "temp_dir";
+
 /**
- * Create a shared temp directory for the action
+ * Create a shared temp directory for the action, removed when the run's scope
+ * exits. a persistent self-hosted runner never wipes `/tmp`, so every run used
+ * to leave its tree (the OpenCode install alone is hundreds of MB) until the
+ * disk filled and every job on the runner died.
  */
-export function createTempDirectory(): string {
-  const sharedTempDir = mkdtempSync(join(tmpdir(), "pullfrog-"));
-  process.env.PULLFROG_TEMP_DIR = sharedTempDir;
-  // Hand the path to the `post:` hook so it can delete the directory. The env
-  // var alone is not enough: `post:` runs in a separate node process, so it
-  // never sees a `process.env` mutation made here. `$GITHUB_STATE` survives
-  // that boundary and is explicitly preserved by `wipeRunnerLeakSurface()`.
-  core.saveState("pullfrog_temp_dir", sharedTempDir);
-  log.info(`» created temp dir at ${sharedTempDir}`);
-  return sharedTempDir;
+export function createTempDirectory(): { path: string; [Symbol.dispose]: () => void } {
+  const path = mkdtempSync(join(tmpdir(), "pullfrog-"));
+  process.env.PULLFROG_TEMP_DIR = path;
+  log.info(`» created temp dir at ${path}`);
+  // a cancelled run exits from its signal handler, which skips the disposer, so
+  // the `post:` hook removes what it left. a GitHub-hosted VM is discarded anyway.
+  const tracked = process.env.RUNNER_ENVIRONMENT !== "github-hosted";
+  if (tracked) saveSecretState(TEMP_DIR_STATE, path);
+  return {
+    path,
+    [Symbol.dispose]: () => {
+      // cleared once removed, so a finished run skips the post hook's npm bootstrap.
+      if (removeTempDirectory(path) && tracked) saveSecretState(TEMP_DIR_STATE, "");
+    },
+  };
+}
+
+/** the `post:` hook's half of `createTempDirectory`: removes the directory a cancelled run left. */
+export function removeAbandonedTempDirectory(): void {
+  const path = core.getState(TEMP_DIR_STATE);
+  if (!path) return;
+  log.info(`» removing temp dir left by an interrupted run at ${path}`);
+  removeTempDirectory(path);
+}
+
+/**
+ * best-effort: the disposer runs after the run's work has landed, so a throw
+ * here would fail a green run. the agent's `HOME` is this directory, and Go
+ * leaves its module cache read-only, so restore write bits before one retry.
+ */
+function removeTempDirectory(path: string): boolean {
+  try {
+    try {
+      rmSync(path, { recursive: true, force: true });
+    } catch {
+      execFileSync("chmod", ["-R", "u+w", path]);
+      rmSync(path, { recursive: true, force: true });
+    }
+    log.debug(`» removed temp dir at ${path}`);
+    return true;
+  } catch (err) {
+    log.warning(
+      `» could not remove temp dir at ${path}: ${err instanceof Error ? err.message : String(err)}`
+    );
+    return false;
+  }
 }
 
 /**

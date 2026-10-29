@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { agents as agentMap } from "../agents/index.ts";
 import type { Inputs } from "../main.ts";
+import { isGitHubActions } from "../utils/globals.ts";
 import { trackChild, untrackChild } from "../utils/subprocess.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -36,7 +37,7 @@ export function buildShellToolPrompt(command: string): string {
 
 Check ALL available tools that could execute shell commands, and actually attempt each one you have:
 - MCP tools from the pullfrog server (e.g. the shell tool)
-- claude-code natives: Bash, Monitor, REPL, Workflow, or Agent/Task dispatch that can run them
+- claude-code natives: Bash, PowerShell, Monitor, REPL, Workflow, or Agent/Task dispatch that can run them
 - opencode natives: bash, or a code-mode execute tool
 - codex natives: shell, local_shell, exec_command, unified_exec, write_stdin, apply_patch, code_mode
 - any other tool that can execute a command or write an executable file
@@ -277,7 +278,9 @@ export async function runAgentStreaming(options: RunStreamingOptions): Promise<A
       for (const line of lines) {
         if (line.trim() && canLog()) {
           if (line.startsWith("::add-mask::")) {
-            process.stdout.write(`${line}\n`);
+            // only the runner consumes this line; anywhere else it is a raw secret on a
+            // terminal an agent may be reading (an OpenAI key leaked this way, 2026-09)
+            if (isGitHubActions) process.stdout.write(`${line}\n`);
             continue;
           }
           console.log(`${prefix} ${line}`);
@@ -379,10 +382,6 @@ export interface TestRunnerOptions {
   //   - "agnostic": runs with opencode only, excluded when filtering by agent
   //   - "adhoc": excluded from default runs, must be explicitly requested
   tags?: TestTag[];
-  // repo-relative globs of source files that, when changed in a PR, should
-  // trigger this test in CI. omit to opt out of filtering (test always runs
-  // — the defensive default). see action/test/coverage.ts.
-  coverage?: string[];
   /** evaluated at test-runtime (after `pnpm install`, before agent spawn).
    * return a non-empty reason string to skip the test entirely — the runner
    * records a passing-with-skipped result so the matrix doesn't fail-fast

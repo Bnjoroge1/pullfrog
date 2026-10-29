@@ -43,8 +43,9 @@ import type { GitHubAppPermissions } from "./github.ts";
  *   wiki/autonomous-maintenance.md's "no injected instruction can cause a
  *   merge" still true. Legitimate pushes go through `push_branch`, which
  *   enforces the branch rules.
- * - `checks` is absent for the same class of reason: no human role grants it,
- *   and it would let the agent post its own passing `pullfrog-approval` status
+ * - `checks` is `read`, never `write`, for the same class of reason: every role
+ *   can read a PR's check runs, but no human role can write one, and write would
+ *   let the agent post its own passing `pullfrog-approval` status
  *   (see wiki/review-approval.md).
  * - Every qualifying role therefore receives the SAME set. The role decides
  *   whether a token is minted at all, not how wide it is — `admin`, `maintain`
@@ -60,7 +61,7 @@ export function mirrorRolePermissions(
     case "maintain":
     case "write":
     case "triage":
-      return { contents: "read", issues: "write", pull_requests: "write" };
+      return { checks: "read", contents: "read", issues: "write", pull_requests: "write" };
     case "read":
     case "none":
     case undefined:

@@ -33,8 +33,21 @@ const DebugInput = type.enumerated("disabled", "enabled");
 export const JsonPayload = type({
   "~pullfrog": "true",
   version: "string",
+  // the server's run type, forwarded verbatim to run-context. optional so a
+  // payload from an older server build still parses against a newer action.
+  "type?": "string | undefined",
   "model?": "string | undefined",
   "modelExplicit?": "boolean | undefined",
+  // optional so a payload from a pre-router server build still parses against a
+  // newer action across a rolling deploy. a new `source` value is released in the
+  // action before the server emits it: the published action rejects the payload.
+  "routing?": type({
+    tier: "'minimal' | 'light' | 'standard' | 'deep'",
+    stakes: "number",
+    workload: "number",
+    source: "'jev' | 'scorer' | 'heuristic' | 'fixed'",
+    rationale: "string",
+  }).or("undefined"),
   "effort?": "number | string | undefined",
   "debug?": "boolean | undefined",
   prompt: "string",
@@ -52,6 +65,9 @@ export const JsonPayload = type({
     // still parses against a newer action across a rolling deploy.
     "unavailable?": "string[]",
   }).or("undefined"),
+  // opaque handle to the server-persisted cross-repo grant. optional so a
+  // payload from an older server build still parses against a newer action.
+  "xrepoGrant?": "string | undefined",
   "timeout?": "string | undefined",
   "progressComment?": type({
     id: "string",
@@ -73,6 +89,14 @@ const COLLABORATOR_PERMISSIONS: AuthorPermission[] = ["admin", "maintain", "writ
 function isCollaborator(event: PayloadEvent): boolean {
   const perm = event.authorPermission;
   return perm !== undefined && COLLABORATOR_PERMISSIONS.includes(perm);
+}
+
+/**
+ * a run steered by someone resolved as unable to push here. an absent permission
+ * is a run no outside author steers (CI fix, a review bot on Pullfrog's own PR).
+ */
+export function isOutsideAuthor(event: PayloadEvent): boolean {
+  return event.authorPermission !== undefined && !isCollaborator(event);
 }
 
 // inputs schema - action inputs from core.getInput()
@@ -340,6 +364,13 @@ export function resolvePayload(
     resolvedShell = "restricted";
   }
 
+  // a run steered by someone who cannot push here does not push for them. an
+  // absent permission is a run no outside author steers (CI fix, a review bot on
+  // Pullfrog's own PR), so only a resolved non-collaborator role clamps.
+  const push = isOutsideAuthor(event)
+    ? "disabled"
+    : (inputs.push ?? repoSettings.push ?? "restricted");
+
   // build payload - precedence: inputs > repoSettings > fallbacks
   // note: modes are NOT in payload - they come from repoSettings in main()
   return {
@@ -349,6 +380,7 @@ export function resolvePayload(
     // explicit only when the model came from a per-run override flag (carried on
     // the JSON payload). a GHA `model` input or the repo default is not explicit.
     modelExplicit: jsonPayload?.modelExplicit ?? false,
+    routing: jsonPayload?.routing,
     effort,
     debug: debug || undefined,
     prompt,
@@ -361,6 +393,7 @@ export function resolvePayload(
     previousRunsNote: jsonPayload?.previousRunsNote,
     event,
     xrepo: jsonPayload?.xrepo,
+    xrepoGrant: jsonPayload?.xrepoGrant,
     timeout: inputs.timeout ?? jsonPayload?.timeout,
     cwd: resolveCwd(inputs.cwd),
     progressComment: jsonPayload?.progressComment,
@@ -369,7 +402,7 @@ export function resolvePayload(
     codexArm: jsonPayload?.codexArm,
 
     // permissions: inputs > repoSettings > fallbacks
-    push: inputs.push ?? repoSettings.push ?? "restricted",
+    push,
     shell: resolvedShell,
 
     // the `pullfrog` run-lifecycle check. ON by default — the whole point is that a PR

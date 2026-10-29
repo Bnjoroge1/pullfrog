@@ -19,13 +19,23 @@ import {
   createProcessOutputActivityTimeout,
   DEFAULT_ACTIVITY_CHECK_INTERVAL_MS,
 } from "./utils/activity.ts";
-import { resolveAgent, resolveModel } from "./utils/agent.ts";
-import { buildRejectedCredentialError, validateAgentApiKey } from "./utils/apiKeys.ts";
+import { activateOpenAICompatibleSet, resolveAgent, resolveModel } from "./utils/agent.ts";
+import {
+  buildRejectedCredentialError,
+  buildTrialSpentError,
+  NoUsableCredentialError,
+  validateAgentApiKey,
+} from "./utils/apiKeys.ts";
 import { formatCommercialGateSummary } from "./utils/billingErrors.ts";
 import { resolveBody } from "./utils/body.ts";
 import { log } from "./utils/cli.ts";
-import { installCodexAuth, PULLFROG_DATA_DIR } from "./utils/codexHome.ts";
+import { installCodexAuth, installXaiAuth, PULLFROG_DATA_DIR } from "./utils/codexHome.ts";
 import { checkConfiguredCredentials } from "./utils/credentialFallback.ts";
+import {
+  initializeCredentialPool,
+  resolvePoolModel,
+  selectConfiguredCredential,
+} from "./utils/credentialPool.ts";
 import { recordDiffReadFromToolUse } from "./utils/diffCoverage.ts";
 import { onExitSignal } from "./utils/exitHandler.ts";
 import { resolveGit, setGitAuthServer } from "./utils/gitAuth.ts";
@@ -58,11 +68,16 @@ import {
   resolvePackageManagerSpec,
 } from "./utils/packageManager.ts";
 import { aggregateUsage, patchWorkflowRunFields } from "./utils/patchWorkflowRunFields.ts";
-import { resolveOutputSchema, resolvePayload, resolvePromptInput } from "./utils/payload.ts";
-import { runProxyResolution } from "./utils/proxy.ts";
+import {
+  isOutsideAuthor,
+  resolveOutputSchema,
+  resolvePayload,
+  resolvePromptInput,
+} from "./utils/payload.ts";
+import { resolveTrialFallback, runProxyResolution } from "./utils/proxy.ts";
 import { fetchPreviousSnapshot, persistSummary, seedSummaryFile } from "./utils/prSummary.ts";
 import { handleAgentResult } from "./utils/run.ts";
-import { isActionPinnedToSha, resolveRunContextData } from "./utils/runContextData.ts";
+import { resolveRunContextData } from "./utils/runContextData.ts";
 import { ossEffortFloor } from "./utils/runEffort.ts";
 import { renderRunError } from "./utils/runErrorRenderer.ts";
 import {
@@ -143,7 +158,14 @@ export async function main(): Promise<MainResult> {
   // get job token for initial API calls
   const jobToken = getJobToken();
   const initialOctokit = createOctokit(jobToken);
-  const runContext = await resolveRunContextData({ octokit: initialOctokit, token: jobToken });
+  const runContext = await resolveRunContextData({
+    octokit: initialOctokit,
+    token: jobToken,
+    runType: typeof resolvedPromptInput === "string" ? undefined : resolvedPromptInput.type,
+    plainPrompt: typeof resolvedPromptInput === "string",
+    routedTier:
+      typeof resolvedPromptInput === "string" ? undefined : resolvedPromptInput.routing?.tier,
+  });
   timer.checkpoint("runContextData");
 
   const payload = resolvePayload(resolvedPromptInput, runContext.repoSettings);
@@ -159,7 +181,6 @@ export async function main(): Promise<MainResult> {
   });
   toolState.model = payload.model;
   toolState.oss = runContext.oss;
-  toolState.shaPinned = isActionPinnedToSha();
   // seed the comment target before every terminal branch. `reportErrorToComment`
   // reads only toolState, so silent triggers otherwise have nowhere to post.
   if (payload.event.issue_number !== undefined) {
@@ -186,10 +207,11 @@ export async function main(): Promise<MainResult> {
       authorPermission: undefined,
       oidc: oidcCredentials,
     });
-    const errorMessage =
-      runContext.commercialRefused === "subscription_unpaid"
-        ? "Pro renewal failed for this organization"
-        : "Pro plan required for this organization";
+    const errorMessage = {
+      commercial: "Pro trial expired for this organization",
+      subscription_ended: "Pro subscription ended for this organization",
+      subscription_unpaid: "Pro renewal failed for this organization",
+    }[runContext.commercialRefused];
     log.error(errorMessage);
     const body = formatCommercialGateSummary({
       reason: runContext.commercialRefused,
@@ -209,7 +231,11 @@ export async function main(): Promise<MainResult> {
   // installers key their fs cache off that variable *at call time* — so a
   // second call silently invalidated the cache and re-downloaded plus
   // re-extracted the whole opencode tarball on every run.
-  const tmpdir = createTempDirectory();
+  //
+  // `using` removes it only when main() returns, after both run-end paths
+  // below have persisted the PR summary and learnings they read from here.
+  using tempDir = createTempDirectory();
+  const tmpdir = tempDir.path;
 
   // install OpenCode + capture the BASELINE model set BEFORE dbSecrets and
   // Codex auth.json are in scope. this is the set of models OpenCode can
@@ -231,35 +257,52 @@ export async function main(): Promise<MainResult> {
   const repoDir = payload.cwd;
   const preIntrospectionDirty = repoDir ? await dirtyTrackedPaths({ cwd: repoDir }) : null;
   const opencodeCliPath = await agents.opencode.install();
-  captureBaselineModels(opencodeCliPath);
+  captureBaselineModels({ cliPath: opencodeCliPath, tmpdir });
 
+  // DRAGON: nothing above this block may resolve a model or read a provider env var — console-stored
+  // config (`OPENAI_COMPATIBLE_MODEL`, `BEDROCK_MODEL_ID`, …) is not in process.env yet. 0.1.85 did, and broke every such run (#1433).
   // inject account-level secrets into process.env (YAML secrets take precedence).
   // sanitizeSecret trims + masks so accidental trailing whitespace doesn't leak
   // through GitHub Actions' line-based log masking. whitespace-only values
   // return null and skip injection so the user sees a clear missing-key error.
+  const injected: string[] = [];
   if (runContext.dbSecrets) {
     for (const [key, value] of Object.entries(runContext.dbSecrets)) {
       if (!process.env[key]) {
         const sanitized = sanitizeSecret(key, value);
-        if (sanitized !== null) process.env[key] = sanitized;
+        if (sanitized === null) continue;
+        process.env[key] = sanitized;
+        injected.push(key);
       }
     }
     const count = Object.keys(runContext.dbSecrets).length;
     if (count > 0) log.info(`» ${count} db secret(s) loaded`);
   }
 
-  // materialize Codex auth.json (idempotent — opencode agent re-calls inside
-  // run() and writes the same file). this has to land BEFORE
-  // captureAuthorizedModels so OpenCode's model introspection sees the
-  // OAuth-routed openai/* models.
+  // a named OpenAI-compatible set only exists from here on when it is stored in Pullfrog.
+  const openAICompatibleSet = activateOpenAICompatibleSet({ slug: payload.model });
+
+  // load one stored subscription per provider for the discovery below. `injected` keeps a
+  // workflow credential distinct from a stored one now that both sit in process.env.
+  await initializeCredentialPool({ ctx: runContext, slug: payload.model, injected });
+
+  // materialize the subscription auth.json entries (idempotent — the opencode
+  // agent re-calls both inside run() and writes the same file; the writer
+  // merges per provider so neither clobbers the other). this has to land
+  // BEFORE captureAuthorizedModels so OpenCode's model introspection sees the
+  // OAuth-routed models: measured, `opencode models` lists 0 `xai/*` entries
+  // without the Grok credential on disk and 12 with it, so skipping this
+  // would read a subscription-only account as unable to run its own models
+  // and fall the run back to the free tier.
   installCodexAuth();
+  installXaiAuth();
 
   // capture the AUTHORIZED model set after dbSecrets + Codex auth.json are
   // applied. this is the authoritative source for the BYOK fallback
   // decision and the opencode-agent path of validateAgentApiKey — strictly
   // more accurate than the static envVars/managedCredentials catalog,
   // which can miss new auth shapes.
-  captureAuthorizedModels(opencodeCliPath);
+  captureAuthorizedModels({ cliPath: opencodeCliPath, tmpdir });
 
   // close the window opened before the baseline capture.
   if (preIntrospectionDirty && repoDir) {
@@ -289,6 +332,7 @@ export async function main(): Promise<MainResult> {
     push: payload.push,
     authorPermission: payload.event.authorPermission,
     xrepo: payload.xrepo,
+    xrepoGrant: payload.xrepoGrant,
     oidc: oidcCredentials,
   });
 
@@ -308,7 +352,7 @@ export async function main(): Promise<MainResult> {
   // tests they had decided to run and could not (#1093). resolving it to
   // `disabled` up front makes the tool set and the prompt agree with reality,
   // and gives the operator one line they can act on.
-  if (payload.shell === "restricted" && getSandboxMethod() === "none") {
+  if (payload.shell !== "disabled" && process.env.CI === "true" && getSandboxMethod() === "none") {
     payload.shell = "disabled";
     log.warning(
       "» shell commands are disabled for this run: this runner provides no PID-namespace isolation " +
@@ -318,11 +362,13 @@ export async function main(): Promise<MainResult> {
     );
   }
 
-  // clear OIDC env vars in restricted mode to prevent agent from minting tokens
-  if (payload.shell !== "enabled") {
-    delete process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
-    delete process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
-  }
+  // clear the OIDC request env so the agent can't mint installation tokens itself.
+  // mid-run token refresh uses the `oidcCredentials` snapshot above, not process.env,
+  // so this is safe in every shell tier — including `enabled`, which passes the full
+  // env to shell commands and so would otherwise hand that mint primitive to any
+  // injected command (a full-permission token for the repo, with no body).
+  delete process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+  delete process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
 
   // Proxy decision: mint an OpenRouter key for OSS repos or managed billing
   // accounts. BillingError (402) and TransientError (503) get rendered inside
@@ -344,6 +390,8 @@ export async function main(): Promise<MainResult> {
 
   const runInfo = await resolveRun({ octokit });
   let toolContext: ToolContext | undefined;
+  // this start's own result, reported on the end-of-run PATCH in `finally`
+  let succeeded = false;
   let progressCallbackDisabled = false;
   let todoTracker: ReturnType<typeof createTodoTracker> | undefined;
   let vertexCredentials: VertexCredentials | undefined;
@@ -374,6 +422,19 @@ export async function main(): Promise<MainResult> {
     await using gitAuthServer = await startGitAuthServer(tmpdir);
     setGitAuthServer(gitAuthServer);
 
+    let resolvedModel = resolveModel({ slug: payload.model });
+    if (!resolvedModel && !payload.proxyModel && runContext.credentialAccess?.candidates.length) {
+      resolvedModel = resolvePoolModel({
+        codexAgent: runContext.repoSettings.codexAgent || payload.codexArm === true,
+      });
+    }
+    let poolSelected =
+      !payload.proxyModel &&
+      (await selectConfiguredCredential({
+        ctx: runContext,
+        model: resolvedModel,
+      }));
+
     // model-access gate: an explicitly-requested per-run model (`--opus`,
     // `--model=<slug>`) that this run can't serve hard-fails here, before the
     // agent starts. standing defaults keep `modelExplicit = false` and fall
@@ -386,7 +447,7 @@ export async function main(): Promise<MainResult> {
       oss: runContext.oss,
       proxyActive: !!payload.proxyModel,
       subsidyTarget: runContext.proxyModel,
-      resolvedModel: resolveModel({ slug: payload.model }),
+      resolvedModel,
       authorized: getAuthorizedModels(),
     });
     if (access.kind === "error") {
@@ -400,7 +461,14 @@ export async function main(): Promise<MainResult> {
       );
     }
     if (access.kind === "proxy") payload.proxyModel = access.target;
-    if (access.kind === "byok") payload.proxyModel = undefined;
+    if (access.kind === "byok") {
+      payload.proxyModel = undefined;
+      if (!poolSelected)
+        poolSelected = await selectConfiguredCredential({
+          ctx: runContext,
+          model: resolvedModel,
+        });
+    }
 
     // a subsidised run is Pullfrog's spend, so it is pinned to `high` on
     // whatever ladder the funded model publishes — matching what every OSS run
@@ -410,21 +478,18 @@ export async function main(): Promise<MainResult> {
       payload.effort = ossEffortFloor({ payload });
     }
 
-    const configuredModel = payload.proxyModel ? undefined : resolveModel({ slug: payload.model });
+    if (payload.proxyModel) resolvedModel = undefined;
 
     // ask the providers whether the configured model's credentials still work
-    // before committing to it. a rejected credential becomes either a run on
-    // whatever the account CAN still route or an accurate error naming
+    // before committing to it. a rejected credential becomes an accurate error naming
     // the credential — never the 401-three-seconds-in that used to send users
     // to a GitHub Actions secrets page they had never put a key in. skipped
     // for proxy runs for the same reason validateAgentApiKey is: the server
     // minted the key and is the authority on it.
-    const credentials = payload.proxyModel
-      ? { kind: "ok" as const }
-      : await checkConfiguredCredentials({
-          model: configuredModel,
-          authorized: getAuthorizedModels(),
-        });
+    const credentials =
+      payload.proxyModel || poolSelected
+        ? { kind: "ok" as const }
+        : await checkConfiguredCredentials({ model: resolvedModel });
     if (credentials.kind === "dead") {
       throw new Error(
         buildRejectedCredentialError({
@@ -436,23 +501,9 @@ export async function main(): Promise<MainResult> {
         })
       );
     }
-    if (credentials.kind === "fellBack" && configuredModel) {
-      log.warning(
-        `» ${credentials.credential} was rejected by its provider — running ${credentials.replacement} instead of ${configuredModel}`
-      );
-      toolState.modelFallback = { from: configuredModel };
-    }
-    // the replacement is a concrete resolve target, not `undefined`: leaving it
-    // unset would let `effectiveModel` fall through to `payload.model` (the
-    // ALIAS slug), which `authorized` doesn't hold and whose env vars were just
-    // deleted — so `validateAgentApiKey` would throw the missing-key error with
-    // the very GitHub-secrets CTA this whole change exists to stop showing.
-    const resolvedModel =
-      credentials.kind === "fellBack" ? credentials.replacement : configuredModel;
-
     vertexCredentials = materializeVertexCredentials({ model: resolvedModel });
 
-    const agent = resolveAgent({
+    let agent = resolveAgent({
       model: resolvedModel,
       proxyModel: payload.proxyModel,
       // the account opt-in and the canary arm are both admissions to codex, so
@@ -493,15 +544,62 @@ export async function main(): Promise<MainResult> {
     // set was captured BEFORE the proxy mint, so it doesn't see the
     // openrouter slug — validating would spuriously throw.
     if (!payload.proxyModel) {
-      validateAgentApiKey({
-        agent,
-        model: effectiveModel,
-        authorized: getAuthorizedModels(),
-        owner: runContext.repo.owner,
-        name: runContext.repo.name,
-        secretsUnavailable: runContext.secretsUnavailable,
-        routerUnfunded: runContext.routerUnfunded,
-      });
+      try {
+        validateAgentApiKey({
+          agent,
+          model: effectiveModel,
+          authorized: getAuthorizedModels(),
+          owner: runContext.repo.owner,
+          name: runContext.repo.name,
+          secretsUnavailable: runContext.secretsUnavailable,
+          routerUnfunded: runContext.routerUnfunded,
+          openAICompatibleSet,
+        });
+      } catch (missingKey) {
+        // the trial fallback fires HERE and nowhere earlier: this is the first
+        // moment anything knows that no credential could pay for the run.
+        // `validateAgentApiKey` has just searched everything the server cannot
+        // see — workflow `env:`, GitHub Actions secrets, the harness-specific
+        // shapes — so an earlier mint would have downgraded accounts that were
+        // fine. the server only granted permission; the verdict is here.
+        //
+        // and only THAT verdict: the same function also throws when opencode
+        // could not start, when a Bedrock/Vertex/Azure/OpenAI-compatible setup
+        // is half-wired, and when we could not read our own stored secrets.
+        // every one of those means the user HAS brought a credential, so
+        // falling back would swap their model for a cheap one and swallow the
+        // message that says what to fix.
+        const funded =
+          runContext.trialFallback && missingKey instanceof NoUsableCredentialError
+            ? await resolveTrialFallback({
+                payload,
+                configuredModel: effectiveModel,
+                creditsLeftUsd: runContext.trialCreditsLeftUsd,
+                oidcCredentials,
+                repo: runContext.repo,
+                toolState,
+              })
+            : false;
+        // a trial whose credits are spent would otherwise read "add an API key" with no
+        // word that the free credits it had been running on are gone.
+        const trialSpent =
+          runContext.trialCreditsLeftUsd !== undefined && runContext.trialCreditsLeftUsd <= 0;
+        if (!funded && trialSpent && missingKey instanceof NoUsableCredentialError) {
+          throw new Error(buildTrialSpentError({ owner: runContext.repo.owner }));
+        }
+        if (!funded) throw missingKey;
+        // the run is now Router-served, and only opencode speaks that provider —
+        // the harness picked above was chosen for a credential that does not
+        // exist. re-resolving is not optional bookkeeping: leaving `agent` alone
+        // sends a proxy run to claude-code or codex, which then dies on the same
+        // missing key this branch just worked around.
+        agent = resolveAgent({
+          model: resolvedModel,
+          proxyModel: payload.proxyModel,
+          codexAgent: runContext.repoSettings.codexAgent || payload.codexArm === true,
+        });
+        toolState.agent = agent.name;
+      }
     }
 
     await setupGit({
@@ -550,6 +648,7 @@ export async function main(): Promise<MainResult> {
     const setupHook = await executeLifecycleHook({
       event: "setup",
       script: runContext.repoSettings.setupScript,
+      shell: payload.shell,
       normalizeWorkingTreeAfter: true,
     });
     if (setupHook.warning) {
@@ -590,6 +689,7 @@ export async function main(): Promise<MainResult> {
       postCheckoutScript: runContext.repoSettings.postCheckoutScript,
       prepushScript: runContext.repoSettings.prepushScript,
       prApproveEnabled: runContext.repoSettings.prApproveEnabled,
+      reviewDrafts: runContext.repoSettings.reviewDrafts,
       autoMergeEnabled: runContext.repoSettings.autoMergeEnabled,
       signedCommits: runContext.repoSettings.signedCommits,
       repoIntelligence: runContext.repoSettings.repoIntelligence,
@@ -628,6 +728,7 @@ export async function main(): Promise<MainResult> {
     // on failure toolState.learningsFilePath stays unset, and downstream
     // consumers (`persistLearnings`, agent harnesses, `resolveInstructions`)
     // all treat undefined as "no learnings affordance this run".
+    toolState.learningsLocked = isOutsideAuthor(payload.event);
     try {
       const learningsPath = await seedLearningsFile({
         tmpdir,
@@ -943,11 +1044,13 @@ export async function main(): Promise<MainResult> {
     // covers the non-review success paths).
     await finalizeSuccessRun({ toolContext, toolState, result, repo: runContext.repo });
 
-    return await handleAgentResult({
+    const outcome = await handleAgentResult({
       result,
       toolContext,
       silent: payload.event.silent ?? false,
     });
+    succeeded = outcome.success;
+    return outcome;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "unknown error occurred";
     progressCallbackDisabled = true;
@@ -962,6 +1065,9 @@ export async function main(): Promise<MainResult> {
       repo: runContext.repo,
       agentDiagnostic: toolState.agentDiagnostic,
       routerActive: !!payload.proxyModel,
+      model: toolState.model,
+      credential: toolState.credential,
+      trial: toolState.modelClamped?.reason === "trial",
     });
     await writeRunErrorOutputs({ rendered, toolState });
 
@@ -998,7 +1104,8 @@ export async function main(): Promise<MainResult> {
       }
     }
 
-    // persist aggregated token + cost usage to the WorkflowRun row.
+    // persist this start's aggregated token + cost usage and result; the server
+    // sums a run's starts onto the WorkflowRun row.
     // this is the single shared cleanup path across every agent implementation:
     // each agent harness returns a single AgentUsage from agent.run() that
     // already aggregates its internal retries via mergeAgentUsage, and the
@@ -1016,9 +1123,8 @@ export async function main(): Promise<MainResult> {
       if (toolState.model) patch.model = toolState.model;
       if (toolState.agent) patch.agent = toolState.agent;
       if (toolState.credential) patch.credential = toolState.credential;
-      if (Object.keys(patch).length > 0) {
-        await patchWorkflowRunFields(toolContext, patch);
-      }
+      patch.succeeded = succeeded;
+      await patchWorkflowRunFields(toolContext, patch);
     }
     cleanupVertexCredentials(vertexCredentials);
   }
