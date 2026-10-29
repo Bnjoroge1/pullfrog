@@ -19,7 +19,7 @@ import {
   createProcessOutputActivityTimeout,
   DEFAULT_ACTIVITY_CHECK_INTERVAL_MS,
 } from "./utils/activity.ts";
-import { resolveAgent, resolveModel } from "./utils/agent.ts";
+import { activateOpenAICompatibleSet, resolveAgent, resolveModel } from "./utils/agent.ts";
 import {
   buildRejectedCredentialError,
   buildTrialSpentError,
@@ -278,6 +278,9 @@ export async function main(): Promise<MainResult> {
     const count = Object.keys(runContext.dbSecrets).length;
     if (count > 0) log.info(`» ${count} db secret(s) loaded`);
   }
+
+  // a named OpenAI-compatible set only exists from here on when it is stored in Pullfrog.
+  const openAICompatibleSet = activateOpenAICompatibleSet({ slug: payload.model });
 
   // load one stored subscription per provider for the discovery below. `injected` keeps a
   // workflow credential distinct from a stored one now that both sit in process.env.
@@ -550,6 +553,7 @@ export async function main(): Promise<MainResult> {
           name: runContext.repo.name,
           secretsUnavailable: runContext.secretsUnavailable,
           routerUnfunded: runContext.routerUnfunded,
+          openAICompatibleSet,
         });
       } catch (missingKey) {
         // the trial fallback fires HERE and nowhere earlier: this is the first

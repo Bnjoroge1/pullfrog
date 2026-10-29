@@ -83,6 +83,14 @@ export {
   SUBSIDY_RUNG,
   TRIAL_FUNDED_USD_LIMIT,
 } from "../external.ts";
+export {
+  isOpenAICompatibleSetName,
+  openAICompatibleEnv,
+  openAICompatibleSetAlias,
+  openAICompatibleSetName,
+  openAICompatibleSetOf,
+  openAICompatibleSets,
+} from "../models.ts";
 export type { Mode } from "../modes.ts";
 export { modes } from "../modes.ts";
 export { type CommercialRefusal, commercialPaywallBody } from "../utils/billingErrors.ts";
